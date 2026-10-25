@@ -232,3 +232,49 @@ fn timestamp_nanoseconds_roundtrip_preserves_boundaries_and_nulls() -> Result<()
     assert!(actual.is_null(3));
     Ok(())
 }
+
+#[test]
+fn timestamp_nanosecond_access_rejects_overflow_in_both_writers() -> Result<()> {
+    use arrow_array::TimestampSecondArray;
+    use std::sync::Arc;
+    let config = RowPackConfig {
+        timestamp_nanoseconds: Some(true),
+        ..Default::default()
+    };
+    let ctx = RowPackContextBuilder::new(
+        vec![RowPackColumn {
+            name: "at".into(),
+            logical_type: IngestedType::Timestamp,
+            fixed_len: None,
+            precision: None,
+            scale: None,
+        }],
+        config,
+    )
+    .finish()?;
+    let encoder = RowPackEncoder::new(ctx.clone())?;
+    let mut access = RowAccess::new(vec![RowAccessHints::default()], RowAccessStats::default());
+    access.set_cols(&[Arc::new(TimestampSecondArray::from(vec![Some(i64::MAX)]))]);
+    let mut out = Vec::new();
+    let mut scratch = RowPackScratch::new(&ctx);
+    assert!(encoder
+        .encode_row_from_access(&mut access, &mut out, &mut scratch)
+        .unwrap_err()
+        .to_string()
+        .contains("nanosecond range"));
+    let (mut tags, mut bools, mut data, mut floats) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    assert!(encoder
+        .encode_row_from_access_into_buffers(
+            &mut access,
+            &mut tags,
+            &mut bools,
+            &mut data,
+            &mut floats,
+            &[]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("nanosecond range"));
+    Ok(())
+}

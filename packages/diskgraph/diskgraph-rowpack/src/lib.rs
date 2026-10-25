@@ -2718,7 +2718,7 @@ impl RowPackEncoder {
                 },
                 IngestedType::Timestamp => match access_or_null(
                     if matches!(col.encoding, ColumnEncoding::TimestampNanosecond) {
-                        access.get_timestamp_nanoseconds(idx)
+                        Ok(access.get_timestamp_nanoseconds(idx)?)
                     } else {
                         access.get_timestamp(idx)
                     },
@@ -3332,7 +3332,7 @@ impl RowPackEncoder {
                 }
                 IngestedType::Timestamp => {
                     match if matches!(col.encoding, ColumnEncoding::TimestampNanosecond) {
-                        access.get_timestamp_nanoseconds(idx)
+                        Ok(access.get_timestamp_nanoseconds(idx)?)
                     } else {
                         access.get_timestamp(idx)
                     } {
