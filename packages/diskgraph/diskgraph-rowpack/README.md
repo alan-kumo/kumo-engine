@@ -187,3 +187,20 @@ All fields are optional. Struct defaults may differ from runtime defaults used b
 - Stored as two’s-complement bytes with width derived from logical precision.
 - Encoding chooses varint for small values and falls back to raw bytes when varint would not be smaller.
 - Decimal storage is always lossless.
+
+### Precise timestamp storage
+
+New ingests may set `rowpack.timestamp_nanoseconds: true` in the table (or
+source) rowpack configuration. Arrow timestamp columns are stored losslessly
+as signed epoch nanoseconds and decoded as Arrow `timestamp[ns]`, including
+nulls and timestamps before 1970. The default remains the existing second
+encoding. Existing rowpacks remain readable; precision cannot be recovered
+from an index ingested with the second encoding. Re-ingest original data to
+use precise temporal-query membership and mode ordering.
+
+The new encoding is appended to the serialized encoding enum so existing
+variant IDs are unchanged. Timestamp source values must fit signed int64
+nanoseconds. Non-Arrow inputs retain the existing second parser; this option
+does not add fractional string parsing. Edge indexes remain coarse; the
+nanosecond temporal-query path checks rowpack clocks rather than using coarse
+edge-window pruning. Timestamp column statistics remain expressed in seconds.

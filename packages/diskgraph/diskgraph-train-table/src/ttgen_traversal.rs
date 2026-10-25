@@ -492,6 +492,7 @@ fn value_ref_to_value(vr: &ValueRef) -> Value {
         ValueRef::Bytes(b) => Value::Str(String::from_utf8_lossy(b).to_string()),
         ValueRef::Date(d) => Value::Int(*d as i64 * 86400),
         ValueRef::Timestamp(secs) => Value::Int(*secs),
+        ValueRef::TimestampNanosecond(ns) => Value::Int(ns.div_euclid(1_000_000_000)),
         ValueRef::Decimal128(v) => Value::Float(*v as f64),
         _ => Value::Int(0), // Uuid, Ip, arrays, etc. → default
     }

@@ -184,3 +184,51 @@ fn test_decode_batch_subset() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn timestamp_nanoseconds_roundtrip_preserves_boundaries_and_nulls() -> Result<()> {
+    use arrow_array::{Array, TimestampNanosecondArray};
+    let columns = vec![RowPackColumn {
+        name: "at".into(),
+        logical_type: IngestedType::Timestamp,
+        fixed_len: None,
+        precision: None,
+        scale: None,
+    }];
+    let config = RowPackConfig {
+        timestamp_nanoseconds: Some(true),
+        ..Default::default()
+    };
+    let mut builder = RowPackContextBuilder::new(columns, config);
+    let values = [-100_000_001, 100_000_001, 900_000_001];
+    for value in values {
+        builder.observe_row(&[ValueRef::TimestampNanosecond(value)])?;
+    }
+    let ctx = RowPackContext::from_bytes(&builder.finish()?.to_bytes()?)?;
+    assert!(matches!(
+        ctx.columns[0].encoding,
+        ColumnEncoding::TimestampNanosecond
+    ));
+    let encoder = RowPackEncoder::new(ctx.clone())?;
+    let mut scratch = RowPackScratch::new(&ctx);
+    let mut rows = Vec::new();
+    for value in values
+        .into_iter()
+        .map(ValueRef::TimestampNanosecond)
+        .chain([ValueRef::Null])
+    {
+        let mut row = Vec::new();
+        encoder.encode_row_into(&[value], &mut row, &mut scratch)?;
+        rows.push(row);
+    }
+    let decoder = RowPackDecoder::new(ctx)?;
+    let batch = decoder.decode_batch_to_arrow(&rows, &[0])?;
+    let actual = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+    assert_eq!(&actual.values()[..3], &values);
+    assert!(actual.is_null(3));
+    Ok(())
+}
