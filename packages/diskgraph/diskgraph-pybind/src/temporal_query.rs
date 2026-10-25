@@ -944,12 +944,6 @@ fn materialize_frame(
     let mut offsets = Vec::with_capacity(roots.len() + 1);
     offsets.push(0);
     for anchor in 0..roots.len() {
-        let lower = plan
-            .start_seconds
-            .map(|value| cutoffs[anchor].saturating_add(value));
-        let upper = plan
-            .stop_seconds
-            .map(|value| cutoffs[anchor].saturating_add(value));
         let mut anchor_rows = Vec::<(usize, Option<i64>, ScalarValue)>::new();
         for row in input_offsets[anchor]..input_offsets[anchor + 1] {
             let timestamp = match time_position {
@@ -966,10 +960,7 @@ fn materialize_frame(
                 }
                 None => None,
             };
-            if timestamp.is_some_and(|value| {
-                lower.is_some_and(|bound| value < bound)
-                    || upper.is_some_and(|bound| value >= bound)
-            }) {
+            if timestamp.is_some_and(|value| !within_window(value, cutoffs[anchor], plan)) {
                 continue;
             }
             let key = scalar_at(decoded.column(primary_key_position).as_ref(), row)?;
@@ -1003,6 +994,16 @@ fn materialize_frame(
     })
 }
 
+fn within_window(timestamp: i64, cutoff: i64, plan: &FramePlan) -> bool {
+    let timestamp = i128::from(timestamp);
+    let cutoff = i128::from(cutoff);
+    plan.start_seconds
+        .is_none_or(|offset| timestamp >= cutoff + i128::from(offset))
+        && plan
+            .stop_seconds
+            .is_none_or(|offset| timestamp < cutoff + i128::from(offset))
+}
+
 // Filtering a broader materialized history preserves its chronological/key order
 // and each window's original sequential numeric accumulation order.
 fn window_frame(
@@ -1013,13 +1014,8 @@ fn window_frame(
     let mut indices = Vec::new();
     let mut offsets = vec![0];
     for (anchor, cutoff) in cutoffs.iter().enumerate() {
-        let lower = plan.start_seconds.map(|value| cutoff.saturating_add(value));
-        let upper = plan.stop_seconds.map(|value| cutoff.saturating_add(value));
         for row in frame.offsets[anchor]..frame.offsets[anchor + 1] {
-            if frame.timestamps[row].is_some_and(|value| {
-                lower.is_some_and(|bound| value < bound)
-                    || upper.is_some_and(|bound| value >= bound)
-            }) {
+            if frame.timestamps[row].is_some_and(|value| !within_window(value, *cutoff, plan)) {
                 continue;
             }
             indices.push(row as u64);
@@ -1052,11 +1048,14 @@ fn covers_window(broad: &FramePlan, narrow: &FramePlan) -> bool {
         && broad.exclude_null_times == narrow.exclude_null_times
         && broad.path == narrow.path
         && broad.root_type == narrow.root_type
-        && broad.path == narrow.path
         && broad.time_column == narrow.time_column
         && broad.distinct == narrow.distinct
-        && broad.start_seconds.unwrap_or(i64::MIN) <= narrow.start_seconds.unwrap_or(i64::MIN)
-        && broad.stop_seconds.unwrap_or(i64::MAX) >= narrow.stop_seconds.unwrap_or(i64::MAX)
+        && broad
+            .start_seconds
+            .is_none_or(|lower| narrow.start_seconds.is_some_and(|value| value >= lower))
+        && broad
+            .stop_seconds
+            .is_none_or(|upper| narrow.stop_seconds.is_some_and(|value| value <= upper))
         && narrow
             .columns
             .iter()
@@ -1332,7 +1331,7 @@ fn reduce_many_ordered(
             .flatten()
             .max()
             .expect("non-null timestamp values");
-        ScalarValue::F64(cutoff.saturating_sub(latest) as f64 / scale as f64)
+        ScalarValue::F64((i128::from(cutoff) - i128::from(latest)) as f64 / scale as f64)
     } else {
         ScalarValue::Null
     };
@@ -1744,21 +1743,13 @@ fn count_frame(
             .flatten();
         if let Some(decoder) = sort_decoder {
             for (anchor, rows) in rows_by_anchor.iter().enumerate() {
-                let lower = plan
-                    .start_seconds
-                    .map(|value| cutoffs[anchor].saturating_add(value));
-                let upper = plan
-                    .stop_seconds
-                    .map(|value| cutoffs[anchor].saturating_add(value));
                 let mut selected = 0;
                 for &(_, raw_sort_key) in rows {
                     let timestamp = decoder.decode(raw_sort_key).0.ok_or_else(|| {
                         format!("frame {:?} contains a null timestamp", plan.name)
                     })?;
                     stats.sort_key_timestamps += 1;
-                    if lower.is_none_or(|bound| timestamp >= bound)
-                        && upper.is_none_or(|bound| timestamp < bound)
-                    {
+                    if within_window(timestamp, cutoffs[anchor], plan) {
                         selected += 1;
                     }
                 }
@@ -1777,12 +1768,6 @@ fn count_frame(
             let decoded = table_rows(table.as_ref(), &flat_nodes, &projection_indices)?;
             let mut row = 0;
             for (anchor, rows) in rows_by_anchor.iter().enumerate() {
-                let lower = plan
-                    .start_seconds
-                    .map(|value| cutoffs[anchor].saturating_add(value));
-                let upper = plan
-                    .stop_seconds
-                    .map(|value| cutoffs[anchor].saturating_add(value));
                 let mut selected = 0;
                 for _ in rows {
                     let value = scalar_at_unit(decoded.column(0).as_ref(), row, plan.time_scale)?
@@ -1796,9 +1781,7 @@ fn count_frame(
                         }
                     };
                     stats.rowpack_timestamps += 1;
-                    if lower.is_none_or(|bound| timestamp >= bound)
-                        && upper.is_none_or(|bound| timestamp < bound)
-                    {
+                    if within_window(timestamp, cutoffs[anchor], plan) {
                         selected += 1;
                     }
                 }
@@ -2469,5 +2452,27 @@ mod tests {
             reduce(RowsView::Owned(&tied), "mode", Some("value"), 0).unwrap(),
             ScalarValue::String(value) if value == "a"
         ));
+    }
+    #[test]
+    fn precise_clock_arithmetic_does_not_saturate() {
+        let rows = vec![row(Some(ScalarValue::I64(-9_000_000_000_000_000_000)))];
+        let value = reduce_ordered(
+            RowsView::Owned(&rows),
+            "recency",
+            Some("value"),
+            9_000_000_000_000_000_000,
+            &[],
+            1_000_000_000,
+        )
+        .unwrap();
+        assert!(matches!(value, ScalarValue::F64(value) if value == 18_000_000_000.0));
+        let plan: FramePlan = serde_json::from_value(serde_json::json!({
+            "name": "edge", "root_type": "root", "path": [], "time_column": "at",
+            "start_seconds": 0, "stop_seconds": 1, "distinct": false, "columns": [],
+            "time_scale": 1_000_000_000
+        }))
+        .unwrap();
+        assert!(within_window(i64::MAX, i64::MAX, &plan));
+        assert!(!within_window(i64::MAX - 1, i64::MAX, &plan));
     }
 }
