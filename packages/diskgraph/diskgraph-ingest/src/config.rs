@@ -150,6 +150,9 @@ pub struct ResolveColumnSpec {
 
 #[derive(Clone)]
 pub struct IngestOptions {
+    /// Permit genuinely empty typed tables in a base relational feature index.
+    /// Nonempty inputs with no usable rows remain errors.
+    pub allow_empty_tables: bool,
     pub profile_dir: Option<PathBuf>,
     pub progress: Option<ProgressCallback>,
     pub parallel: bool,
@@ -186,6 +189,7 @@ pub struct IngestOptions {
 impl Default for IngestOptions {
     fn default() -> Self {
         Self {
+            allow_empty_tables: false,
             profile_dir: None,
             progress: None,
             parallel: true,

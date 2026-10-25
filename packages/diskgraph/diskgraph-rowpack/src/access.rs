@@ -2494,6 +2494,64 @@ impl<'p> RowAccess<'p> {
         }
     }
 
+    /// Exact Arrow timestamp conversion for opt-in nanosecond rowpacks.
+    /// Non-Arrow timestamp inputs use the established second parser; their
+    /// subsecond text/numeric interpretation is not silently redefined here.
+    pub fn get_timestamp_nanoseconds(&self, idx: usize) -> Result<Option<i64>> {
+        let array = self.array(idx)?;
+        if array.is_null(self.row) {
+            return Ok(None);
+        }
+        use arrow_schema::TimeUnit;
+        let (value, scale) = match array.data_type() {
+            DataType::Timestamp(TimeUnit::Second, _) => (
+                array
+                    .as_any()
+                    .downcast_ref::<arrow_array::TimestampSecondArray>()
+                    .unwrap()
+                    .value(self.row),
+                1_000_000_000i64,
+            ),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => (
+                array
+                    .as_any()
+                    .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+                    .unwrap()
+                    .value(self.row),
+                1_000_000i64,
+            ),
+            DataType::Timestamp(TimeUnit::Microsecond, _) => (
+                array
+                    .as_any()
+                    .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+                    .unwrap()
+                    .value(self.row),
+                1_000i64,
+            ),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => (
+                array
+                    .as_any()
+                    .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+                    .unwrap()
+                    .value(self.row),
+                1i64,
+            ),
+            _ => {
+                return self
+                    .get_timestamp(idx)?
+                    .map(|secs| {
+                        secs.checked_mul(1_000_000_000)
+                            .ok_or_else(|| anyhow!("timestamp outside nanosecond range"))
+                    })
+                    .transpose()
+            }
+        };
+        value
+            .checked_mul(scale)
+            .map(Some)
+            .ok_or_else(|| anyhow!("timestamp outside nanosecond range"))
+    }
+
     pub fn get_timestamp(&self, idx: usize) -> Result<Option<i64>> {
         let array = self.array(idx)?;
         if array.is_null(self.row) {

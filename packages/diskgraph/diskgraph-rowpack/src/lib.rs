@@ -116,6 +116,10 @@ impl BpeTrie {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RowPackConfig {
+    /// Keep Arrow timestamp values at nanosecond precision in new rowpacks.
+    /// Existing rowpacks and the default second encoding remain unchanged.
+    #[serde(default)]
+    pub timestamp_nanoseconds: Option<bool>,
     #[serde(default)]
     pub sample_rows: Option<usize>,
     #[serde(default)]
@@ -143,6 +147,7 @@ pub struct RowPackConfig {
 impl Default for RowPackConfig {
     fn default() -> Self {
         Self {
+            timestamp_nanoseconds: Some(false),
             sample_rows: Some(100_000),
             max_dict_bytes_per_col: Some(1_000_000),
             max_dict_entries: Some(50_000),
@@ -163,6 +168,7 @@ impl RowPackConfig {
         let base = outer.cloned().unwrap_or_default();
         if let Some(inner) = inner {
             RowPackConfig {
+                timestamp_nanoseconds: inner.timestamp_nanoseconds.or(base.timestamp_nanoseconds),
                 sample_rows: inner.sample_rows.or(base.sample_rows),
                 max_dict_bytes_per_col: inner
                     .max_dict_bytes_per_col
@@ -372,6 +378,7 @@ pub enum ColumnEncoding {
         values: Vec<f64>,
         storage: FloatStorage,
     },
+    TimestampNanosecond,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -417,6 +424,7 @@ pub enum ValueRef<'a> {
     Date(i32),
     /// Epoch seconds.
     Timestamp(i64),
+    TimestampNanosecond(i64),
     Decimal128(i128),
     Decimal256([u8; 32]),
     Float32Array(&'a [f32]),
@@ -988,6 +996,9 @@ impl RowPackContextBuilder {
                 (IngestedType::Decimal128, None) | (IngestedType::Decimal256, None) => {
                     return Err(anyhow!("rowpack decimal precision missing"));
                 }
+                (IngestedType::Timestamp, _) if self.config.timestamp_nanoseconds == Some(true) => {
+                    ColumnEncoding::TimestampNanosecond
+                }
                 _ => self.stats[idx].choose_encoding(
                     *logical_type,
                     &self.config,
@@ -1036,7 +1047,7 @@ fn estimate_column_bytes(encoding: &ColumnEncoding, stats: &ColumnStats) -> usiz
                 (*bits).div_ceil(8) as usize
             }
         }
-        ColumnEncoding::Timestamp => {
+        ColumnEncoding::Timestamp | ColumnEncoding::TimestampNanosecond => {
             let secs_bits = if stats.ts_seen {
                 int_bits(stats.ts_min, stats.ts_max)
             } else {
@@ -1515,7 +1526,7 @@ impl ColumnStats {
                 self.bytes_count += 1;
             }
             ValueRef::Date(_) => {}
-            ValueRef::Timestamp(secs) => {
+            ValueRef::Timestamp(secs) | ValueRef::TimestampNanosecond(secs) => {
                 self.ts_min = self.ts_min.min(*secs);
                 self.ts_max = self.ts_max.max(*secs);
                 self.ts_seen = true;
@@ -1981,11 +1992,8 @@ fn string_dict_values(
     if stats.string_counts.is_empty() {
         return None;
     }
-    let mut entries: Vec<(&Vec<u8>, usize)> = stats
-        .string_counts
-        .iter()
-        .map(|(k, v)| (k, *v))
-        .collect();
+    let mut entries: Vec<(&Vec<u8>, usize)> =
+        stats.string_counts.iter().map(|(k, v)| (k, *v)).collect();
     // Break ties on the value itself: `string_counts` is a randomly-seeded hash
     // map, and a stable sort would otherwise leave equally-frequent values in
     // its iteration order. Indices are priced as varints below, so that would
@@ -2004,7 +2012,9 @@ fn string_dict_values(
         values.push(value.clone());
     }
     let avg_hits = coverage as f32 / values.len().max(1) as f32;
-    if values.is_empty() || coverage as f32 / total < config.string_dict_coverage() || avg_hits < 2.0
+    if values.is_empty()
+        || coverage as f32 / total < config.string_dict_coverage()
+        || avg_hits < 2.0
     {
         return None;
     }
@@ -2588,43 +2598,36 @@ impl RowPackEncoder {
                 },
                 IngestedType::Float64 => match access_or_null(access.get_float64(idx)) {
                     None => 0u8,
-                    Some(v) => {
-                        match &col.encoding {
-                            ColumnEncoding::Float { storage } => encode_float_with_tag(
-                                &mut scratch.data,
-                                col.logical_type,
-                                *storage,
-                                v,
-                            )?,
-                            ColumnEncoding::FloatDict { .. } => encode_float_dict(
-                                &mut scratch.data,
-                                col,
-                                self.dict_maps[idx].as_ref(),
-                                v,
-                            )?,
-                            _ => return Err(anyhow!("rowpack float64 encoding mismatch")),
+                    Some(v) => match &col.encoding {
+                        ColumnEncoding::Float { storage } => {
+                            encode_float_with_tag(&mut scratch.data, col.logical_type, *storage, v)?
                         }
-                    }
+                        ColumnEncoding::FloatDict { .. } => encode_float_dict(
+                            &mut scratch.data,
+                            col,
+                            self.dict_maps[idx].as_ref(),
+                            v,
+                        )?,
+                        _ => return Err(anyhow!("rowpack float64 encoding mismatch")),
+                    },
                 },
                 IngestedType::Float32 => match access_or_null(access.get_float32(idx)) {
                     None => 0u8,
-                    Some(v) => {
-                        match &col.encoding {
-                            ColumnEncoding::Float { storage } => encode_float_with_tag(
-                                &mut scratch.data,
-                                col.logical_type,
-                                *storage,
-                                v as f64,
-                            )?,
-                            ColumnEncoding::FloatDict { .. } => encode_float_dict(
-                                &mut scratch.data,
-                                col,
-                                self.dict_maps[idx].as_ref(),
-                                v as f64,
-                            )?,
-                            _ => return Err(anyhow!("rowpack float32 encoding mismatch")),
-                        }
-                    }
+                    Some(v) => match &col.encoding {
+                        ColumnEncoding::Float { storage } => encode_float_with_tag(
+                            &mut scratch.data,
+                            col.logical_type,
+                            *storage,
+                            v as f64,
+                        )?,
+                        ColumnEncoding::FloatDict { .. } => encode_float_dict(
+                            &mut scratch.data,
+                            col,
+                            self.dict_maps[idx].as_ref(),
+                            v as f64,
+                        )?,
+                        _ => return Err(anyhow!("rowpack float32 encoding mismatch")),
+                    },
                 },
                 IngestedType::String => {
                     #[allow(clippy::manual_unwrap_or_default)]
@@ -2713,7 +2716,13 @@ impl RowPackEncoder {
                         }
                     }
                 },
-                IngestedType::Timestamp => match access_or_null(access.get_timestamp(idx)) {
+                IngestedType::Timestamp => match access_or_null(
+                    if matches!(col.encoding, ColumnEncoding::TimestampNanosecond) {
+                        Ok(access.get_timestamp_nanoseconds(idx)?)
+                    } else {
+                        access.get_timestamp(idx)
+                    },
+                ) {
                     None => 0u8,
                     Some(secs) => {
                         write_varint(zigzag_encode(secs), &mut scratch.data);
@@ -3057,12 +3066,13 @@ impl RowPackEncoder {
                     // present for this column, encode it directly (varint via
                     // encode_uint, mirroring the normal arm) instead of reading
                     // the source parquet, which has no such column.
-                    let scalar_override = resolve_overrides
-                        .and_then(|o| o.get(idx))
-                        .and_then(|o| match o {
-                            ResolveOverride::Scalar(v) => Some(*v),
-                            _ => None,
-                        });
+                    let scalar_override =
+                        resolve_overrides
+                            .and_then(|o| o.get(idx))
+                            .and_then(|o| match o {
+                                ResolveOverride::Scalar(v) => Some(*v),
+                                _ => None,
+                            });
                     let value = match scalar_override {
                         Some(v) => Some(v),
                         None => access_or_parse_failure(access.get_uint64(idx), idx, observer),
@@ -3320,18 +3330,30 @@ impl RowPackEncoder {
                         }
                     }
                 }
-                IngestedType::Timestamp => match access.get_timestamp(idx) {
-                    Ok(None) => 0u8,
-                    Ok(Some(secs)) => {
-                        observer.observe_timestamp(idx, secs);
-                        write_varint(zigzag_encode(secs), data);
-                        1u8
+                IngestedType::Timestamp => {
+                    match if matches!(col.encoding, ColumnEncoding::TimestampNanosecond) {
+                        Ok(access.get_timestamp_nanoseconds(idx)?)
+                    } else {
+                        access.get_timestamp(idx)
+                    } {
+                        Ok(None) => 0u8,
+                        Ok(Some(secs)) => {
+                            let stats_secs =
+                                if matches!(col.encoding, ColumnEncoding::TimestampNanosecond) {
+                                    secs.div_euclid(1_000_000_000)
+                                } else {
+                                    secs
+                                };
+                            observer.observe_timestamp(idx, stats_secs);
+                            write_varint(zigzag_encode(secs), data);
+                            1u8
+                        }
+                        Err(_) => {
+                            observer.observe_parse_failure(idx);
+                            0u8
+                        }
                     }
-                    Err(_) => {
-                        observer.observe_parse_failure(idx);
-                        0u8
-                    }
-                },
+                }
                 IngestedType::Decimal128 => {
                     match access_or_parse_failure(access.get_decimal128(idx), idx, observer) {
                         None => 0u8,
@@ -3466,12 +3488,13 @@ impl RowPackEncoder {
                     // and run the existing list encoder. The column's encoding
                     // is bits:64 (Int64Array), so require_fits_in_signed(64) is
                     // a no-op and node-ids are never rejected.
-                    let list_override = resolve_overrides
-                        .and_then(|o| o.get(idx))
-                        .and_then(|o| match o {
-                            ResolveOverride::List(ids) => Some(ids),
-                            _ => None,
-                        });
+                    let list_override =
+                        resolve_overrides
+                            .and_then(|o| o.get(idx))
+                            .and_then(|o| match o {
+                                ResolveOverride::List(ids) => Some(ids),
+                                _ => None,
+                            });
                     if let Some(ids) = list_override {
                         let view = IntListView {
                             start: 0,
@@ -3564,7 +3587,16 @@ fn encode_string(
     let ColumnEncoding::String { encoding } = &col.encoding else {
         return Err(anyhow!("rowpack string encoding mismatch"));
     };
-    encode_string_value(out, value, encoding, _dict, _alphabet, _bpe, _bpe_tokens, _lz4_buf)
+    encode_string_value(
+        out,
+        value,
+        encoding,
+        _dict,
+        _alphabet,
+        _bpe,
+        _bpe_tokens,
+        _lz4_buf,
+    )
 }
 
 /// Encodes one string against an encoding directly. List columns hold their
@@ -3848,7 +3880,8 @@ fn encode_value_with_tag<'a>(
             encode_int(out, true, *varint, *bits, *v as i128)?;
             Ok(1)
         }
-        (ColumnEncoding::Timestamp, ValueRef::Timestamp(secs)) => {
+        (ColumnEncoding::Timestamp, ValueRef::Timestamp(secs))
+        | (ColumnEncoding::TimestampNanosecond, ValueRef::TimestampNanosecond(secs)) => {
             write_varint(zigzag_encode(*secs), out);
             Ok(1)
         }
@@ -5176,9 +5209,7 @@ fn estimate_lz4_bytes(samples: &[Vec<u8>]) -> u64 {
         buf.resize(lz4_flex::block::get_maximum_output_size(sample.len()), 0);
         let compressed_total = match lz4_flex::block::compress_into(sample, &mut buf) {
             Ok(written) => {
-                varint_bytes_u64(sample.len() as u64)
-                    + varint_bytes_u64(written as u64)
-                    + written
+                varint_bytes_u64(sample.len() as u64) + varint_bytes_u64(written as u64) + written
             }
             Err(_) => raw_total,
         };
@@ -5603,7 +5634,19 @@ impl RowPackDecoder {
             if !requested_mask[idx] {
                 continue;
             }
-            let (field, builder) = make_arrow_builder(&col.name, col.logical_type, rows.len())?;
+            let (field, builder) = if matches!(col.encoding, ColumnEncoding::TimestampNanosecond) {
+                (
+                    arrow_schema::Field::new(
+                        &col.name,
+                        arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+                        true,
+                    ),
+                    Box::new(TimestampNanosecondBuilder::with_capacity(rows.len()))
+                        as Box<dyn ArrayBuilder>,
+                )
+            } else {
+                make_arrow_builder(&col.name, col.logical_type, rows.len())?
+            };
             decoded_indices.push(idx);
             fields.push(field);
             builders.push(builder);
@@ -5779,6 +5822,14 @@ fn decode_value_msgpack(
         ColumnEncoding::Timestamp => {
             let secs = zigzag_decode(read_varint(data)?);
             write_msgpack_timestamp(out, secs, 0)?;
+        }
+        ColumnEncoding::TimestampNanosecond => {
+            let ns = zigzag_decode(read_varint(data)?);
+            write_msgpack_timestamp(
+                out,
+                ns.div_euclid(1_000_000_000),
+                ns.rem_euclid(1_000_000_000) as u32,
+            )?;
         }
         ColumnEncoding::Decimal {
             scale,
@@ -5956,6 +6007,13 @@ fn decode_value_json(
             let formatted = format_timestamp_default(secs, 0);
             JsonValue::from(formatted)
         }
+        ColumnEncoding::TimestampNanosecond => {
+            let ns = zigzag_decode(read_varint(data)?);
+            JsonValue::from(format_timestamp_default(
+                ns.div_euclid(1_000_000_000),
+                ns.rem_euclid(1_000_000_000) as u32,
+            ))
+        }
         ColumnEncoding::Decimal {
             scale,
             bytes,
@@ -6115,6 +6173,9 @@ fn decode_value_ref<'a>(
             let secs = zigzag_decode(read_varint(data)?);
             Ok(ValueRef::Timestamp(secs))
         }
+        ColumnEncoding::TimestampNanosecond => Ok(ValueRef::TimestampNanosecond(zigzag_decode(
+            read_varint(data)?,
+        ))),
         ColumnEncoding::Decimal {
             scale,
             bytes,
@@ -6315,7 +6376,7 @@ fn decode_value_skip(
         ColumnEncoding::Date { varint, bits } => {
             let _ = decode_int(data, *varint, *bits)?;
         }
-        ColumnEncoding::Timestamp => {
+        ColumnEncoding::Timestamp | ColumnEncoding::TimestampNanosecond => {
             let _ = read_varint(data)?;
         }
         ColumnEncoding::Decimal {
@@ -7189,6 +7250,13 @@ fn append_null(builder: &mut dyn arrow_array::builder::ArrayBuilder) {
         b.append_null();
         return;
     }
+    if let Some(b) = builder
+        .as_any_mut()
+        .downcast_mut::<TimestampNanosecondBuilder>()
+    {
+        b.append_null();
+        return;
+    }
     if let Some(b) = builder.as_any_mut().downcast_mut::<Date32Builder>() {
         b.append_null();
         return;
@@ -7489,6 +7557,14 @@ fn decode_and_append_to_builder(
                 .downcast_mut::<Date32Builder>()
                 .unwrap()
                 .append_value(v as i32);
+        }
+        ColumnEncoding::TimestampNanosecond => {
+            let ns = zigzag_decode(read_varint(data)?);
+            builder
+                .as_any_mut()
+                .downcast_mut::<TimestampNanosecondBuilder>()
+                .unwrap()
+                .append_value(ns);
         }
         ColumnEncoding::Timestamp => {
             let secs = zigzag_decode(read_varint(data)?);

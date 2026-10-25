@@ -61,6 +61,9 @@ struct Args {
     /// Write pprof profiles per phase to this directory.
     #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = ".")]
     profile: Option<PathBuf>,
+    /// Permit genuinely empty typed tables in a base relational index.
+    #[arg(long, default_value_t = false)]
+    allow_empty_tables: bool,
     /// Enable the shared worker pool.
     #[arg(long, default_value_t = true)]
     parallel: bool,
@@ -324,6 +327,7 @@ fn run_worker(args: Args) -> Result<()> {
     };
     let peak_tracker = PeakMemTracker::start();
     let options = IngestOptions {
+        allow_empty_tables: args.allow_empty_tables,
         profile_dir: args.profile.clone(),
         progress: build_progress(),
         parallel: args.parallel,

@@ -262,6 +262,21 @@ fn ingest_rejects_each_empty_table_even_when_another_table_has_rows() -> Result<
             .contains("graph source returned zero rows for table Empty"),
         "unexpected error: {error:#}"
     );
+    let allowed = dir.path().join("allowed");
+    ingest(
+        &source_path,
+        allowed.to_str().unwrap(),
+        Dest::Local,
+        IngestOptions {
+            allow_empty_tables: true,
+            ..Default::default()
+        },
+    )?;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(allowed.join("index_metadata.json"))?)?;
+    assert!(metadata["node_types"]
+        .as_array().unwrap().iter().any(|node| node["name"] == "Empty"));
+    assert!(allowed.join("nodes/empty/node_data.ctx").is_file());
     Ok(())
 }
 
@@ -405,6 +420,7 @@ fn ingest_parquet_with_edges_and_rowpack() -> Result<()> {
         output_root.to_str().unwrap(),
         Dest::Local,
         IngestOptions {
+            allow_empty_tables: false,
             profile_dir: None,
             progress: None,
             parallel: true,
@@ -646,6 +662,7 @@ fn ingest_parquet_multi_file_table_with_two_shards() -> Result<()> {
         output_root.to_str().unwrap(),
         Dest::Local,
         IngestOptions {
+            allow_empty_tables: false,
             profile_dir: None,
             progress: None,
             parallel: true,
@@ -775,6 +792,7 @@ fn ingest_parquet_with_sorted_mapping() -> Result<()> {
     fs::write(&source_path, serde_json::to_vec_pretty(&source)?)?;
 
     let options = IngestOptions {
+        allow_empty_tables: false,
         profile_dir: None,
         progress: None,
         parallel: true,
@@ -941,6 +959,7 @@ fn ingest_parquet_with_int_pk_lookup() -> Result<()> {
         output_root.to_str().unwrap(),
         Dest::Local,
         IngestOptions {
+            allow_empty_tables: false,
             profile_dir: None,
             progress: None,
             parallel: true,
@@ -1057,6 +1076,7 @@ fn ingest_csv_with_bytes_pk_mapping() -> Result<()> {
     fs::write(&source_path, serde_json::to_vec_pretty(&source)?)?;
 
     let options = IngestOptions {
+        allow_empty_tables: false,
         profile_dir: None,
         progress: None,
         parallel: true,
@@ -1145,6 +1165,7 @@ fn ingest_pk_map_header_has_expected_format() -> Result<()> {
     fs::write(&source_path, serde_json::to_vec_pretty(&source)?)?;
 
     let options = IngestOptions {
+        allow_empty_tables: false,
         profile_dir: None,
         progress: None,
         parallel: true,
@@ -1345,6 +1366,7 @@ fn ingest_relationship_uses_dest_timestamp_sort_key() -> Result<()> {
         output_root.to_str().unwrap(),
         Dest::Local,
         IngestOptions {
+            allow_empty_tables: false,
             profile_dir: None,
             progress: None,
             parallel: true,
@@ -1631,6 +1653,7 @@ fn ingest_edge_table_mixed_sort_keys() -> Result<()> {
         output_root.to_str().unwrap(),
         Dest::Local,
         IngestOptions {
+            allow_empty_tables: false,
             profile_dir: None,
             progress: None,
             parallel: true,
@@ -2162,6 +2185,7 @@ fn ingest_weight_expr_with_backticks() -> Result<()> {
         output_root.to_str().unwrap(),
         Dest::Local,
         IngestOptions {
+            allow_empty_tables: false,
             profile_dir: None,
             progress: None,
             parallel: true,
@@ -2266,6 +2290,7 @@ fn ingest_weight_expr_with_log_and_abs() -> Result<()> {
         output_root.to_str().unwrap(),
         Dest::Local,
         IngestOptions {
+            allow_empty_tables: false,
             profile_dir: None,
             progress: None,
             parallel: true,
@@ -4189,6 +4214,7 @@ fn ingest_survives_empty_shards() -> Result<()> {
         output_root.to_str().unwrap(),
         Dest::Local,
         IngestOptions {
+            allow_empty_tables: false,
             profile_dir: None,
             progress: None,
             parallel: true,

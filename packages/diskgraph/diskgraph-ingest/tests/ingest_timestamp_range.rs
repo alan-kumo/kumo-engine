@@ -559,7 +559,7 @@ fn test_time64_microsecond_create_time_does_not_drop_rows() -> Result<()> {
 /// Reject an unusable base table, not an individual malformed row or empty shard.
 #[test]
 fn test_all_invalid_required_times_do_not_publish() -> Result<()> {
-    for col_stats in [false, true] {
+    for (col_stats, allow_empty_tables) in [(false, false), (false, true), (true, false), (true, true)] {
         for value in [Some("not-a-time"), None] {
             let dir = tempdir()?;
             let path = dir.path().join("events.parquet");
@@ -592,6 +592,7 @@ fn test_all_invalid_required_times_do_not_publish() -> Result<()> {
                 output_root.to_str().unwrap(),
                 Dest::Local,
                 IngestOptions {
+                    allow_empty_tables,
                     col_stats,
                     ..IngestOptions::default()
                 },

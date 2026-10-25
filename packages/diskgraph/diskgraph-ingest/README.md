@@ -299,3 +299,15 @@ RowPackConfig fields (all optional):
 
 The context file path is written into `index_metadata.json` under
 `node_data_compression.context_path` and used by the index reader/explorer.
+
+## Empty tables in relational feature indexes
+
+The default base ingest still rejects empty tables. For a relational feature
+index, Python `diskgraph.ingest(..., allow_empty_tables=True)`, Rust
+`IngestOptions { allow_empty_tables: true, ..Default::default() }`, or CLI
+`--allow-empty-tables` permits a genuinely empty table with an explicit source
+schema. The index retains its column context and empty node type, so downstream
+aggregate queries can return the normal empty-domain answers. A nonempty table
+whose rows are all discarded remains an error; the option must not hide invalid
+keys or invalid required timestamps. Existing index-extension behavior remains
+unchanged.

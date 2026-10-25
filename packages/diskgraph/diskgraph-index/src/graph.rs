@@ -1882,6 +1882,7 @@ impl TableReader {
 fn temporal_value_to_epoch_secs(val: &diskgraph_rowpack::ValueRef<'_>) -> Option<i64> {
     match val {
         diskgraph_rowpack::ValueRef::Timestamp(secs) => Some(*secs),
+        diskgraph_rowpack::ValueRef::TimestampNanosecond(ns) => Some(ns.div_euclid(1_000_000_000)),
         diskgraph_rowpack::ValueRef::Int64(ns) => Some(*ns / 1_000_000_000),
         diskgraph_rowpack::ValueRef::Date(days) => Some(*days as i64 * 86400),
         diskgraph_rowpack::ValueRef::Null => None,
