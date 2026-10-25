@@ -52,6 +52,8 @@ struct QueryPlan {
     sequences: Vec<SequencePlan>,
     #[serde(default)]
     aggregates: Vec<AggregatePlan>,
+    #[serde(default)]
+    parent_frames: Vec<ParentFramePlan>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +67,25 @@ struct FramePlan {
     stop_seconds: Option<i64>,
     distinct: bool,
     columns: Vec<String>,
+    #[serde(default = "default_time_scale")]
+    time_scale: i64,
+    #[serde(default)]
+    root_time_column: Option<String>,
+    #[serde(default)]
+    exclude_null_times: bool,
+}
+
+fn default_time_scale() -> i64 {
+    1
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParentFramePlan {
+    name: String,
+    parents: String,
+    children: FramePlan,
+    values: Vec<NamedReduction>,
 }
 
 #[derive(Debug, PartialEq, Eq, Deserialize)]
@@ -72,6 +93,8 @@ struct FramePlan {
 struct PathStep {
     relation: String,
     destination_type: String,
+    #[serde(default)]
+    time_column: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +125,8 @@ struct AggregatePlan {
     groups: Vec<GroupPlan>,
     operation: String,
     column: Option<String>,
+    #[serde(default)]
+    mode_order: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +142,8 @@ struct NamedReduction {
     name: String,
     operation: String,
     column: Option<String>,
+    #[serde(default)]
+    mode_order: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -270,6 +297,7 @@ struct MaterializedFrame {
     node_ids: Vec<u64>,
     timestamps: Vec<Option<i64>>,
     offsets: Vec<usize>,
+    time_scale: i64,
 }
 
 struct SequenceResult {
@@ -449,6 +477,75 @@ fn scalar_at(array: &dyn Array, row: usize) -> Result<ScalarValue, String> {
     ))
 }
 
+// Preserve declared timestamp ticks instead of passing through floating seconds.
+fn scalar_at_unit(array: &dyn Array, row: usize, scale: i64) -> Result<ScalarValue, String> {
+    if array.is_null(row) {
+        return Ok(ScalarValue::Null);
+    }
+    let physical = if let Some(v) = array.as_any().downcast_ref::<TimestampSecondArray>() {
+        Some((v.value(row), 1i128))
+    } else if let Some(v) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
+        Some((v.value(row), 1_000))
+    } else if let Some(v) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+        Some((v.value(row), 1_000_000))
+    } else if let Some(v) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        Some((v.value(row), 1_000_000_000))
+    } else {
+        None
+    };
+    if let Some((value, units)) = physical {
+        let ticks = (i128::from(value) * i128::from(scale)).div_euclid(units);
+        return Ok(ScalarValue::I64(i64::try_from(ticks).map_err(|_| {
+            "timestamp exceeds selected int64 time unit".to_string()
+        })?));
+    }
+    if let Some(v) = array.as_any().downcast_ref::<Date32Array>() {
+        return Ok(ScalarValue::I64(
+            i64::from(v.value(row))
+                .checked_mul(86400)
+                .and_then(|v| v.checked_mul(scale))
+                .ok_or("date exceeds selected time unit")?,
+        ));
+    }
+    if let Some(v) = array.as_any().downcast_ref::<Date64Array>() {
+        let ticks = (i128::from(v.value(row)) * i128::from(scale)).div_euclid(1000);
+        return Ok(ScalarValue::I64(
+            i64::try_from(ticks).map_err(|_| "date exceeds selected time unit")?,
+        ));
+    }
+    scalar_at(array, row)
+}
+
+fn eligible_nodes(
+    reader: &GraphIndexReader,
+    table_name: &str,
+    nodes: &[u64],
+    clock: &str,
+    cutoff: i64,
+    scale: i64,
+    inclusive: bool,
+    skip_null: bool,
+) -> Result<Vec<u64>, String> {
+    let table = reader
+        .table(table_name)
+        .ok_or_else(|| format!("unknown table {table_name:?}"))?;
+    let indices = projection(table.as_ref(), &[clock.to_string()])?;
+    let values = table_rows(table.as_ref(), nodes, &indices)?;
+    let mut selected = Vec::new();
+    for (row, node) in nodes.iter().copied().enumerate() {
+        match scalar_at_unit(values.column(0).as_ref(), row, scale)?.epoch_seconds()? {
+            Some(time) if time < cutoff || (inclusive && time == cutoff) => selected.push(node),
+            None if !skip_null => {
+                return Err(format!(
+                    "table {table_name:?} has null time column {clock:?}"
+                ))
+            }
+            _ => (),
+        }
+    }
+    Ok(selected)
+}
+
 fn relation_columns(
     table: &TableReader,
     relation_name: &str,
@@ -594,6 +691,9 @@ fn matching_time_decoder(
 }
 
 fn validate_frame_plan(plan: &FramePlan, root_type: &str) -> Result<(), String> {
+    if plan.time_scale != 1 && plan.time_scale != 1_000_000_000 {
+        return Err("temporal frame time_scale must be 1 or 1000000000".into());
+    }
     if plan.name.is_empty() {
         return Err("temporal frame names must be non-empty".into());
     }
@@ -665,9 +765,26 @@ fn materialize_frame(
 
     let traversal_started = Instant::now();
     let mut rows_by_anchor = Vec::with_capacity(roots.len());
-    let mut destination = root_type.to_string();
+    let mut destination = plan
+        .path
+        .last()
+        .map(|p| p.destination_type.clone())
+        .unwrap_or_else(|| root_type.to_string());
     for (anchor, &root) in roots.iter().enumerate() {
-        let mut frontier = vec![root];
+        let mut frontier = if let Some(clock) = &plan.root_time_column {
+            eligible_nodes(
+                reader,
+                root_type,
+                &[root],
+                clock,
+                cutoffs[anchor],
+                plan.time_scale,
+                true,
+                true,
+            )?
+        } else {
+            vec![root]
+        };
         destination = root_type.to_string();
         for (hop, step) in plan.path.iter().enumerate() {
             let relation = reader
@@ -688,7 +805,9 @@ fn materialize_frame(
             let table = reader
                 .table(&destination)
                 .ok_or_else(|| format!("unknown source table {destination:?}"))?;
-            let decoder = if hop + 1 == plan.path.len()
+            let decoder = if plan.time_scale == 1
+                && !plan.exclude_null_times
+                && hop + 1 == plan.path.len()
                 && (plan.start_seconds.is_some() || plan.stop_seconds.is_some())
             {
                 plan.time_column.as_deref().and_then(|clock| {
@@ -722,6 +841,22 @@ fn materialize_frame(
                     plan.distinct,
                     stats,
                 )?);
+            }
+            if hop + 1 < plan.path.len() {
+                if let Some(clock) = &step.time_column {
+                    stats.rows_decoded += next.len();
+                    stats.values_decoded += next.len();
+                    next = eligible_nodes(
+                        reader,
+                        &step.destination_type,
+                        &next,
+                        clock,
+                        cutoffs[anchor],
+                        plan.time_scale,
+                        false,
+                        plan.exclude_null_times,
+                    )?;
+                }
             }
             frontier = next;
             destination = step.destination_type.clone();
@@ -816,13 +951,17 @@ fn materialize_frame(
         let mut anchor_rows = Vec::<(usize, Option<i64>, ScalarValue)>::new();
         for row in input_offsets[anchor]..input_offsets[anchor + 1] {
             let timestamp = match time_position {
-                Some(position) => Some(
-                    scalar_at(decoded.column(position).as_ref(), row)?
+                Some(position) => {
+                    match scalar_at_unit(decoded.column(position).as_ref(), row, plan.time_scale)?
                         .epoch_seconds()?
-                        .ok_or_else(|| {
-                            format!("frame {:?} contains a null timestamp", plan.name)
-                        })?,
-                ),
+                    {
+                        None if plan.exclude_null_times => continue,
+                        None => {
+                            return Err(format!("frame {:?} contains a null timestamp", plan.name))
+                        }
+                        Some(time) => Some(time),
+                    }
+                }
                 None => None,
             };
             if timestamp.is_some_and(|value| {
@@ -858,6 +997,7 @@ fn materialize_frame(
         node_ids,
         timestamps,
         offsets,
+        time_scale: plan.time_scale,
     })
 }
 
@@ -900,11 +1040,16 @@ fn window_frame(
             .map(|i| frame.timestamps[*i as usize])
             .collect(),
         offsets,
+        time_scale: frame.time_scale,
     })
 }
 
 fn covers_window(broad: &FramePlan, narrow: &FramePlan) -> bool {
-    broad.root_type == narrow.root_type
+    broad.time_scale == narrow.time_scale
+        && broad.root_time_column == narrow.root_time_column
+        && broad.exclude_null_times == narrow.exclude_null_times
+        && broad.path == narrow.path
+        && broad.root_type == narrow.root_type
         && broad.path == narrow.path
         && broad.time_column == narrow.time_column
         && broad.distinct == narrow.distinct
@@ -1044,7 +1189,9 @@ impl RowsView<'_> {
                     format!("frame {:?} did not project column {column:?}", frame.name)
                 })?;
                 (*start..*stop)
-                    .map(|row| scalar_at(frame.batch.column(position).as_ref(), row))
+                    .map(|row| {
+                        scalar_at_unit(frame.batch.column(position).as_ref(), row, frame.time_scale)
+                    })
                     .collect()
             }
             Self::Owned(rows) => rows
@@ -1070,22 +1217,46 @@ fn validate_reduction(operation: &str, column: Option<&str>) -> Result<(), Strin
     Ok(())
 }
 
+#[cfg(test)]
 fn reduce(
     rows: RowsView<'_>,
     operation: &str,
     column: Option<&str>,
     cutoff: i64,
 ) -> Result<ScalarValue, String> {
-    Ok(reduce_many(rows, &[operation], column, cutoff)?.remove(0))
+    reduce_ordered(rows, operation, column, cutoff, &[], 1)
 }
 
-// A column is decoded once; numeric moments and categorical hashing are each
-// accumulated once. Numeric additions retain the original row/operation order.
+fn reduce_ordered(
+    rows: RowsView<'_>,
+    operation: &str,
+    column: Option<&str>,
+    cutoff: i64,
+    mode_order: &[String],
+    scale: i64,
+) -> Result<ScalarValue, String> {
+    Ok(reduce_many_ordered(rows, &[operation], column, cutoff, mode_order, scale)?.remove(0))
+}
+
+#[cfg(test)]
 fn reduce_many(
     rows: RowsView<'_>,
     operations: &[&str],
     column: Option<&str>,
     cutoff: i64,
+) -> Result<Vec<ScalarValue>, String> {
+    reduce_many_ordered(rows, operations, column, cutoff, &[], 1)
+}
+
+// A column is decoded once; numeric moments and categorical hashing are each
+// accumulated once. Numeric additions retain the original row/operation order.
+fn reduce_many_ordered(
+    rows: RowsView<'_>,
+    operations: &[&str],
+    column: Option<&str>,
+    cutoff: i64,
+    mode_order: &[String],
+    scale: i64,
 ) -> Result<Vec<ScalarValue>, String> {
     for operation in operations {
         validate_reduction(operation, column)?;
@@ -1159,11 +1330,13 @@ fn reduce_many(
             .flatten()
             .max()
             .expect("non-null timestamp values");
-        ScalarValue::F64(cutoff.saturating_sub(latest) as f64)
+        ScalarValue::F64(cutoff.saturating_sub(latest) as f64 / scale as f64)
     } else {
         ScalarValue::Null
     };
-    let mode = if has("mode") {
+    let mode = if has("mode") && !mode_order.is_empty() {
+        ordered_mode(&rows, column.expect("mode column"), mode_order, &counts)?
+    } else if has("mode") {
         counts
             .values()
             .max_by(|left, right| {
@@ -1201,69 +1374,120 @@ fn reduce_many(
         .collect()
 }
 
-fn group_rows(rows: RowsView<'_>, plan: &GroupPlan, cutoff: i64) -> Result<Vec<OwnedRow>, String> {
+fn compare_tie(left: &ScalarValue, right: &ScalarValue) -> Result<Ordering, String> {
+    match (left, right) {
+        (ScalarValue::Null, ScalarValue::Null) => Ok(Ordering::Equal),
+        (ScalarValue::Null, _) => Ok(Ordering::Greater),
+        (_, ScalarValue::Null) => Ok(Ordering::Less),
+        _ => left.compare(right),
+    }
+}
+
+fn ordered_mode(
+    rows: &RowsView<'_>,
+    column: &str,
+    order: &[String],
+    counts: &HashMap<String, (usize, ScalarValue)>,
+) -> Result<ScalarValue, String> {
+    let values = rows.values(column)?;
+    let columns = order
+        .iter()
+        .map(|name| rows.values(name))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut minima = HashMap::<String, Vec<ScalarValue>>::new();
+    for (row, value) in values.iter().enumerate() {
+        if matches!(value, ScalarValue::Null) {
+            continue;
+        }
+        let entry = minima
+            .entry(value.equality_key())
+            .or_insert_with(|| vec![ScalarValue::Null; order.len()]);
+        for (index, column) in columns.iter().enumerate() {
+            if compare_tie(&column[row], &entry[index])? == Ordering::Less {
+                entry[index] = column[row].clone();
+            }
+        }
+    }
+    let mut best: Option<(&String, &(usize, ScalarValue))> = None;
+    for (key, candidate) in counts {
+        let replace = if let Some((old_key, old)) = best {
+            let mut ordering = old.0.cmp(&candidate.0);
+            if ordering == Ordering::Equal {
+                for (left, right) in minima[key].iter().zip(&minima[old_key]) {
+                    ordering = compare_tie(left, right)?;
+                    if ordering != Ordering::Equal {
+                        break;
+                    }
+                }
+            }
+            if ordering == Ordering::Equal {
+                ordering = candidate.1.stable_sort_key().cmp(&old.1.stable_sort_key());
+            }
+            ordering == Ordering::Less
+        } else {
+            true
+        };
+        if replace {
+            best = Some((key, candidate));
+        }
+    }
+    Ok(best.map(|(_, v)| v.1.clone()).unwrap_or(ScalarValue::Null))
+}
+
+fn group_rows(
+    rows: RowsView<'_>,
+    plan: &GroupPlan,
+    cutoff: i64,
+    scale: i64,
+) -> Result<Vec<OwnedRow>, String> {
     if plan.keys.is_empty() || plan.values.is_empty() {
         return Err("group_by requires keys and values".into());
     }
-    let key_columns = plan
-        .keys
+    let mut needed = plan.keys.iter().cloned().collect::<HashSet<_>>();
+    for reduction in &plan.values {
+        validate_reduction(&reduction.operation, reduction.column.as_deref())?;
+        needed.extend(reduction.column.iter().cloned());
+        needed.extend(reduction.mode_order.iter().cloned());
+    }
+    let columns = needed
         .iter()
-        .map(|key| rows.values(key))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|name| Ok((name.clone(), rows.values(name)?)))
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
     let mut groups = BTreeMap::<Vec<(String, String)>, Vec<usize>>::new();
     for row in 0..rows.len() {
-        let key = key_columns
+        let key = plan
+            .keys
             .iter()
-            .map(|values| values[row].stable_sort_key())
-            .collect::<Vec<_>>();
+            .map(|key| columns[key][row].stable_sort_key())
+            .collect();
         groups.entry(key).or_default().push(row);
     }
-    let value_columns = plan
-        .values
-        .iter()
-        .map(|value| {
-            validate_reduction(&value.operation, value.column.as_deref())?;
-            Ok(match &value.column {
-                Some(column) => Some(rows.values(column)?),
-                None => None,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let mut output = Vec::with_capacity(groups.len());
+    let mut output = Vec::new();
     for indices in groups.into_values() {
-        let mut values = BTreeMap::new();
-        for (key_index, key) in plan.keys.iter().enumerate() {
-            values.insert(key.clone(), key_columns[key_index][indices[0]].clone());
-        }
-        for (reduction_index, reduction) in plan.values.iter().enumerate() {
-            let selected = value_columns[reduction_index]
-                .as_ref()
-                .map(|column| {
-                    indices
-                        .iter()
-                        .map(|index| OwnedRow {
-                            values: BTreeMap::from([(
-                                reduction.column.clone().expect("column present"),
-                                column[*index].clone(),
-                            )]),
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| {
-                    vec![
-                        OwnedRow {
-                            values: BTreeMap::new()
-                        };
-                        indices.len()
-                    ]
-                });
+        let selected = indices
+            .iter()
+            .map(|row| OwnedRow {
+                values: columns
+                    .iter()
+                    .map(|(name, column)| (name.clone(), column[*row].clone()))
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let mut values = plan
+            .keys
+            .iter()
+            .map(|key| (key.clone(), columns[key][indices[0]].clone()))
+            .collect::<BTreeMap<_, _>>();
+        for reduction in &plan.values {
             values.insert(
                 reduction.name.clone(),
-                reduce(
+                reduce_ordered(
                     RowsView::Owned(&selected),
                     &reduction.operation,
                     reduction.column.as_deref(),
                     cutoff,
+                    &reduction.mode_order,
+                    scale,
                 )?,
             );
         }
@@ -1286,24 +1510,118 @@ fn aggregate_result(
             stop: frame.offsets[anchor + 1],
         };
         let value = if let Some((first, remaining)) = plan.groups.split_first() {
-            let mut grouped = group_rows(frame_view, first, cutoff)?;
+            let mut grouped = group_rows(frame_view, first, cutoff, frame.time_scale)?;
             for group in remaining {
-                grouped = group_rows(RowsView::Owned(&grouped), group, cutoff)?;
+                grouped = group_rows(RowsView::Owned(&grouped), group, cutoff, frame.time_scale)?;
             }
-            reduce(
+            reduce_ordered(
                 RowsView::Owned(&grouped),
                 &plan.operation,
                 plan.column.as_deref(),
                 cutoff,
+                &plan.mode_order,
+                frame.time_scale,
             )?
         } else {
-            reduce(frame_view, &plan.operation, plan.column.as_deref(), cutoff)?
+            reduce_ordered(
+                frame_view,
+                &plan.operation,
+                plan.column.as_deref(),
+                cutoff,
+                &plan.mode_order,
+                frame.time_scale,
+            )?
         };
         values.push(value);
     }
     Ok(AggregateResult {
         name: plan.name.clone(),
         values,
+    })
+}
+
+fn parent_frame(
+    reader: &GraphIndexReader,
+    plan: &ParentFramePlan,
+    parents: &MaterializedFrame,
+    cutoffs: &[i64],
+    timings: &mut QueryTimings,
+    stats: &mut QueryStats,
+) -> Result<MaterializedFrame, String> {
+    let mut parent_cutoffs = Vec::with_capacity(parents.node_ids.len());
+    for (anchor, cutoff) in cutoffs.iter().enumerate() {
+        parent_cutoffs.extend(std::iter::repeat_n(
+            *cutoff,
+            parents.offsets[anchor + 1] - parents.offsets[anchor],
+        ));
+    }
+    let children = materialize_frame(
+        reader,
+        &plan.children,
+        &parents.destination,
+        &parents.node_ids,
+        &parent_cutoffs,
+        None,
+        None,
+        timings,
+        stats,
+    )?;
+    let mut arrays = parents.batch.columns().to_vec();
+    let mut fields = parents
+        .batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    let mut positions = parents.positions.clone();
+    for reduction in &plan.values {
+        validate_reduction(&reduction.operation, reduction.column.as_deref())?;
+        if positions.contains_key(&reduction.name) {
+            return Err(format!(
+                "parent reduction shadows column {:?}",
+                reduction.name
+            ));
+        }
+        let values = parent_cutoffs
+            .par_iter()
+            .enumerate()
+            .map(|(parent, cutoff)| {
+                reduce_ordered(
+                    RowsView::Frame {
+                        frame: &children,
+                        start: children.offsets[parent],
+                        stop: children.offsets[parent + 1],
+                    },
+                    &reduction.operation,
+                    reduction.column.as_deref(),
+                    *cutoff,
+                    &reduction.mode_order,
+                    children.time_scale,
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let array = scalar_values_to_array(&values)?;
+        positions.insert(reduction.name.clone(), arrays.len());
+        fields.push(arrow_schema::Field::new(
+            &reduction.name,
+            array.data_type().clone(),
+            true,
+        ));
+        arrays.push(array);
+    }
+    let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), arrays)
+        .map_err(|e| e.to_string())?;
+    Ok(MaterializedFrame {
+        name: plan.name.clone(),
+        destination: parents.destination.clone(),
+        deferred_columns: HashMap::new(),
+        positions,
+        batch,
+        node_ids: parents.node_ids.clone(),
+        timestamps: parents.timestamps.clone(),
+        offsets: parents.offsets.clone(),
+        time_scale: parents.time_scale,
     })
 }
 
@@ -1320,12 +1638,33 @@ fn count_frame(
 
     let traversal_started = Instant::now();
     let mut rows_by_anchor = Vec::with_capacity(roots.len());
-    let mut destination = root_type.to_string();
+    let mut destination = plan
+        .path
+        .last()
+        .map(|p| p.destination_type.clone())
+        .unwrap_or_else(|| root_type.to_string());
     let mut final_sort_key = None::<EdgeSortKeyMetadata>;
-    for &root in roots {
-        let mut frontier = vec![(root, 0)];
+    for (anchor, &root) in roots.iter().enumerate() {
+        let eligible = if let Some(clock) = &plan.root_time_column {
+            eligible_nodes(
+                reader,
+                root_type,
+                &[root],
+                clock,
+                cutoffs[anchor],
+                plan.time_scale,
+                true,
+                true,
+            )?
+        } else {
+            vec![root]
+        };
+        let mut frontier = eligible
+            .into_iter()
+            .map(|node| (node, 0))
+            .collect::<Vec<_>>();
         destination = root_type.to_string();
-        for step in &plan.path {
+        for (hop, step) in plan.path.iter().enumerate() {
             let relation = reader
                 .merged_edge_relations()
                 .iter()
@@ -1356,6 +1695,25 @@ fn count_frame(
                 )?;
                 next.extend(destinations.into_iter().zip(sort_keys));
             }
+            if hop + 1 < plan.path.len() {
+                if let Some(clock) = &step.time_column {
+                    let ids = next.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+                    let eligible = eligible_nodes(
+                        reader,
+                        &step.destination_type,
+                        &ids,
+                        clock,
+                        cutoffs[anchor],
+                        plan.time_scale,
+                        false,
+                        plan.exclude_null_times,
+                    )?
+                    .into_iter()
+                    .collect::<HashSet<_>>();
+                    stats.rowpack_timestamps += ids.len();
+                    next.retain(|(id, _)| eligible.contains(id));
+                }
+            }
             frontier = next;
             destination = step.destination_type.clone();
             final_sort_key = relation.dest_sort_key.clone();
@@ -1379,8 +1737,9 @@ fn count_frame(
             .time_column
             .as_ref()
             .expect("frame validation requires a time column for bounds");
-        let sort_decoder =
-            matching_time_decoder(final_sort_key.as_ref(), &destination, time_column);
+        let sort_decoder = (plan.time_scale == 1 && !plan.exclude_null_times)
+            .then(|| matching_time_decoder(final_sort_key.as_ref(), &destination, time_column))
+            .flatten();
         if let Some(decoder) = sort_decoder {
             for (anchor, rows) in rows_by_anchor.iter().enumerate() {
                 let lower = plan
@@ -1424,12 +1783,16 @@ fn count_frame(
                     .map(|value| cutoffs[anchor].saturating_add(value));
                 let mut selected = 0;
                 for _ in rows {
-                    let timestamp = scalar_at(decoded.column(0).as_ref(), row)?
-                        .epoch_seconds()?
-                        .ok_or_else(|| {
-                            format!("frame {:?} contains a null timestamp", plan.name)
-                        })?;
+                    let value = scalar_at_unit(decoded.column(0).as_ref(), row, plan.time_scale)?
+                        .epoch_seconds()?;
                     row += 1;
+                    let timestamp = match value {
+                        Some(value) => value,
+                        None if plan.exclude_null_times => continue,
+                        None => {
+                            return Err(format!("frame {:?} contains a null timestamp", plan.name))
+                        }
+                    };
                     stats.rowpack_timestamps += 1;
                     if lower.is_none_or(|bound| timestamp >= bound)
                         && upper.is_none_or(|bound| timestamp < bound)
@@ -1584,6 +1947,10 @@ pub(crate) fn execute(
         let sequence = match consumers.as_slice() {
             [sequence]
                 if !plan.aggregates.iter().any(|a| a.frame == frame_plan.name)
+                    && !plan
+                        .parent_frames
+                        .iter()
+                        .any(|p| p.parents == frame_plan.name)
                     && sequence.limit.is_some() =>
             {
                 Some(*sequence)
@@ -1592,7 +1959,11 @@ pub(crate) fn execute(
         };
         // Keep the aggregate's complete, identically ordered inputs, but defer
         // sequence-only columns until its final rows have been selected.
-        let full_columns = (consumers.len() == 1
+        let full_columns = (!plan
+            .parent_frames
+            .iter()
+            .any(|p| p.parents == frame_plan.name)
+            && consumers.len() == 1
             && consumers[0].limit.is_some()
             && plan.aggregates.iter().any(|a| a.frame == frame_plan.name))
         .then(|| {
@@ -1605,8 +1976,15 @@ pub(crate) fn execute(
                 if let Some(group) = aggregate.groups.first() {
                     columns.extend(group.keys.iter().map(String::as_str));
                     columns.extend(group.values.iter().filter_map(|v| v.column.as_deref()));
+                    columns.extend(
+                        group
+                            .values
+                            .iter()
+                            .flat_map(|v| v.mode_order.iter().map(String::as_str)),
+                    );
                 } else {
                     columns.extend(aggregate.column.as_deref());
+                    columns.extend(aggregate.mode_order.iter().map(String::as_str));
                 }
             }
             columns
@@ -1625,6 +2003,24 @@ pub(crate) fn execute(
             &mut stats,
         )?;
         frames.insert(frame_plan.name.clone(), frame);
+    }
+
+    for parent_plan in &plan.parent_frames {
+        let parents = frames
+            .get(&parent_plan.parents)
+            .ok_or_else(|| format!("unknown parent frame {:?}", parent_plan.parents))?;
+        if frames.contains_key(&parent_plan.name) {
+            return Err(format!("duplicate parent frame {:?}", parent_plan.name));
+        }
+        let frame = parent_frame(
+            reader,
+            parent_plan,
+            parents,
+            cutoffs,
+            &mut timings,
+            &mut stats,
+        )?;
+        frames.insert(parent_plan.name.clone(), frame);
     }
 
     let sequence_started = Instant::now();
@@ -1646,7 +2042,7 @@ pub(crate) fn execute(
     let aggregate_started = Instant::now();
     // Preserve plan order while sharing each ungrouped frame/column scan.
     let mut aggregate_values = vec![Vec::new(); plan.aggregates.len()];
-    let mut groups = BTreeMap::<(&str, Option<&str>), Vec<usize>>::new();
+    let mut groups = BTreeMap::<(&str, Option<&str>, Vec<String>), Vec<usize>>::new();
     for (index, aggregate) in plan.aggregates.iter().enumerate() {
         validate_reduction(&aggregate.operation, aggregate.column.as_deref())?;
         let frame = frames.get(&aggregate.frame).ok_or_else(|| {
@@ -1657,14 +2053,18 @@ pub(crate) fn execute(
         })?;
         if aggregate.groups.is_empty() {
             groups
-                .entry((&aggregate.frame, aggregate.column.as_deref()))
+                .entry((
+                    &aggregate.frame,
+                    aggregate.column.as_deref(),
+                    aggregate.mode_order.clone(),
+                ))
                 .or_default()
                 .push(index);
         } else {
             aggregate_values[index] = aggregate_result(frame, aggregate, cutoffs)?.values;
         }
     }
-    for ((frame_name, column), indices) in groups {
+    for ((frame_name, column, mode_order), indices) in groups {
         let frame = &frames[frame_name];
         let operations = indices
             .iter()
@@ -1674,7 +2074,7 @@ pub(crate) fn execute(
             .par_iter()
             .enumerate()
             .map(|(anchor, cutoff)| {
-                reduce_many(
+                reduce_many_ordered(
                     RowsView::Frame {
                         frame,
                         start: frame.offsets[anchor],
@@ -1683,6 +2083,8 @@ pub(crate) fn execute(
                     &operations,
                     column,
                     *cutoff,
+                    &mode_order,
+                    frame.time_scale,
                 )
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -1920,6 +2322,9 @@ mod tests {
             stop_seconds: Some(0),
             distinct: true,
             columns: vec!["value".into()],
+            time_scale: 1,
+            root_time_column: None,
+            exclude_null_times: false,
         };
         let narrow = FramePlan {
             name: "short".into(),
@@ -1956,6 +2361,7 @@ mod tests {
                 Some(199),
             ],
             offsets: vec![0, 4, 6],
+            time_scale: 1,
         };
         let selected = window_frame(&frame, &narrow, &[100, 200]).unwrap();
         assert_eq!(selected.offsets, vec![0, 2, 4]);
