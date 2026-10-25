@@ -1885,6 +1885,7 @@ mod tests_repopulate_helpers {
             cat_count_strategy: crate::col_stats::CategoryCountStrategy::None,
             row_subsample: false,
             text_sample_stats: HashMap::new(),
+            allow_empty_tables: false,
             parent_index_path: None,
             resolve_columns: Vec::new(),
         }
@@ -2626,6 +2627,7 @@ mod dst_degree_bitmap_budget_tests {
 }
 
 struct IngestContext {
+    allow_empty_tables: bool,
     source: GraphConfig,
     target: std::sync::Arc<OutputTarget>,
     profile_dir: Option<PathBuf>,
@@ -7276,6 +7278,7 @@ impl IngestContext {
             cat_count_strategy: options.cat_count_strategy,
             row_subsample: options.row_subsample,
             text_sample_stats: HashMap::new(),
+            allow_empty_tables: options.allow_empty_tables,
             parent_index_path: options.parent_index_path,
             resolve_columns: options.resolve_columns,
         })
@@ -7772,7 +7775,7 @@ impl IngestContext {
                 }
                 validation.finish()?;
                 let source_rows = validation.rows_seen();
-                if source_rows == 0 && self.parent_index_path.is_none() {
+                if source_rows == 0 && self.parent_index_path.is_none() && !self.allow_empty_tables {
                     return Err(anyhow!(
                         "graph source returned zero rows for table {}",
                         table.name
@@ -11849,8 +11852,14 @@ impl IngestContext {
                 .cloned()
                 .unwrap_or_else(|| vec![0; self.num_shards]);
             // Use retained rows, not source counts or max_id (zero is also a
-            // valid node ID). Extensions may legitimately add an empty table.
-            if self.parent_index_path.is_none() && shard_rows.iter().all(|&rows| rows == 0) {
+            // valid node ID). Extensions and explicit empty-table ingests may
+            // add an empty table, but must not hide nonempty invalid inputs.
+            let empty_source = self.allow_empty_tables
+                && self.logical_source_rows_by_table.get(&table.name) == Some(&0);
+            if self.parent_index_path.is_none()
+                && !empty_source
+                && shard_rows.iter().all(|&rows| rows == 0)
+            {
                 return Err(PublicIngestError::new(format!(
                     "graph table {} has no usable rows after ingestion filtering",
                     table.name

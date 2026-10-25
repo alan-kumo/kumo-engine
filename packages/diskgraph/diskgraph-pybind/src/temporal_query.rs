@@ -63,6 +63,8 @@ struct FramePlan {
     root_type: String,
     path: Vec<PathStep>,
     time_column: Option<String>,
+    // Legacy field names: offsets use the selected frame's clock ticks.
+    // With time_scale=1e9, cutoffs and offsets are nanoseconds.
     start_seconds: Option<i64>,
     stop_seconds: Option<i64>,
     distinct: bool,

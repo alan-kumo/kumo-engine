@@ -1336,6 +1336,7 @@ pub fn convert_kumo_config(
     edges_map_threads=None,
     index_threads=None,
     parent_index_path=None,
+    allow_empty_tables=false,
 ))]
 #[tracing::instrument(
     level = "info",
@@ -1361,6 +1362,7 @@ pub fn ingest(
     edges_map_threads: Option<usize>,
     index_threads: Option<usize>,
     parent_index_path: Option<&str>,
+    allow_empty_tables: bool,
 ) -> PyResult<String> {
     let start_time = std::time::Instant::now();
     info!(
@@ -1397,6 +1399,7 @@ pub fn ingest(
         .transpose()?;
 
     let options = diskgraph_ingest::IngestOptions {
+        allow_empty_tables,
         profile_dir: None,
         progress: diskgraph_ingest::progress::build_progress(),
         parallel: true,
